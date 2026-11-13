@@ -4,7 +4,7 @@ Oh My Pi plugin that adds `/ctf`: containerized, operator-supervised automation 
 
 Design notes: [CTF-Plugin-Plan wiki page](https://github.com/justjamm/omp-ctf/wiki/CTF-Plugin-Plan). VM testing guide: [VM-Test-Handoff](https://github.com/justjamm/omp-ctf/wiki/VM-Test-Handoff).
 
-**Status:** unit tests and typecheck pass, and the isolated head/worker sessions were checked against the real OMP 18.20.0 SDK. The Docker path (setup script, image builds, browser container, noVNC, downloads, real runs) has **not** been exercised yet.
+**Status:** unit tests and typecheck pass, and the isolated head/worker sessions were checked against the real OMP 18.20.0 SDK. On macOS (Colima) the setup script, both image builds, the browser container (loopback-only noVNC with token enforcement, no CDP), driver navigate/observe/screenshot/download, the download broker, and challenge-container hardening have been verified. A full model-driven `/ctf` run against a real CTF site has **not** been exercised yet.
 
 **Supported hosts:** macOS and Linux (apt- or dnf-based). Windows is not supported.
 
