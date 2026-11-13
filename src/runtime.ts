@@ -4,7 +4,7 @@
  * restricted tool allowlist containing only the container-mediated `ctf_*` tools.
  */
 import type { Model } from "@oh-my-pi/pi-ai";
-import type { AgentSession, CreateAgentSessionOptions, ExtensionAPI, ExtensionUIContext, ModelRegistry, Settings, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import type { AgentSession, CreateAgentSessionOptions, CustomTool, ExtensionAPI, ExtensionUIContext, ModelRegistry, Settings } from "@oh-my-pi/pi-coding-agent";
 import type { ChallengeManifest, ChallengeStatus, CtfConfig, CtfStore, EventManifest } from "./config.ts";
 import { BROWSER_IMAGE, CHALLENGE_IMAGE, type Docker, dockerContextDir } from "./docker.ts";
 import {
@@ -20,6 +20,7 @@ import {
 	type Zod,
 } from "./tools.ts";
 import { capText, newChallengeId, randomHex } from "./validate.ts";
+import type { CtfEvent, RunView } from "./view.ts";
 
 export type { Model };
 export type Sdk = Pick<ExtensionAPI["pi"], "createAgentSession" | "SessionManager" | "Settings" | "AgentRegistry">;
@@ -96,6 +97,46 @@ export function classifyWorkerOutcome(session: Pick<AgentSession, "messages" | "
 	return { status: "done", text: capText(text, 16_384) };
 }
 
+/** Tool outcomes observed for one session. */
+export interface ToolStats {
+	ok: number;
+	failed: number;
+	firstError?: string;
+}
+
+export interface HeadOutcome {
+	phase: "finished" | "failed";
+	error?: string;
+	summary: string;
+}
+
+/**
+ * Decide whether the head actually ran. A provider error, or a turn in which every tool call
+ * failed, is a failure with its reason, never a silent "finished".
+ */
+export function classifyHeadOutcome(session: Pick<AgentSession, "messages" | "getLastAssistantText">, stats: ToolStats): HeadOutcome {
+	const summary = session.getLastAssistantText() ?? "";
+	const last = [...session.messages].reverse().find(message => message.role === "assistant") as
+		| { stopReason?: string; errorMessage?: string }
+		| undefined;
+	if (last?.stopReason === "error") return { phase: "failed", error: `Head model error: ${last.errorMessage ?? "unknown"}`, summary };
+	if (stats.ok === 0 && stats.failed > 0) {
+		return { phase: "failed", error: `None of the head's ${stats.failed} tool calls succeeded. First error: ${stats.firstError}`, summary };
+	}
+	if (stats.ok === 0) return { phase: "failed", error: "The head finished without using any tools.", summary };
+	return { phase: "finished", summary };
+}
+
+/** First text block of a tool result, bounded, for diagnostics. */
+export function toolResultText(result: unknown): string {
+	if (result instanceof Error) return result.message.slice(0, 300);
+	if (result && typeof result === "object" && "content" in result && Array.isArray(result.content)) {
+		const first = result.content.find((block: unknown) => block && typeof block === "object" && "text" in block);
+		if (first && typeof first === "object" && "text" in first) return String(first.text).slice(0, 300);
+	}
+	return String(result).slice(0, 300);
+}
+
 export interface RunDeps {
 	sdk: Sdk;
 	z: Zod;
@@ -107,7 +148,10 @@ export interface RunDeps {
 	hostPaths: string[];
 	/** Private empty directory used as SDK session cwd. */
 	sessionCwd: string;
-	onStatus: (lines: string[]) => void;
+	/** Structured snapshot for the status widget/footer (throttled). */
+	onStatus: (view: RunView) => void;
+	/** Run events for the main OMP session (transcript and model context). */
+	onEvent: (event: CtfEvent) => void;
 }
 
 export interface RunParams {
@@ -147,6 +191,8 @@ export class CtfRun implements ToolHost {
 	phase: RunPhase = "starting";
 	headActivity = "";
 	headError: string | undefined;
+	/** Head's final reply (untrusted model output), kept for status and the main session. */
+	headSummary = "";
 
 	#deps: RunDeps;
 	#config: CtfConfig;
@@ -208,11 +254,31 @@ export class CtfRun implements ToolHost {
 		return [...this.#records.keys()];
 	}
 
-	markSubmitted(id: string): void {
+	markSubmitted(id: string, flag: string): void {
 		const record = this.#records.get(id);
 		if (record) record.status = "submitted";
 		void this.#persist();
 		this.#scheduleStatus();
+		this.#emit({ kind: "submitted", tone: "success", title: `Flag submitted for ${record?.name ?? id}`, lines: [`Challenge ${id}`, `Flag: ${flag}`] });
+	}
+
+	noteQuestion(scope: Scope, question: string, answer: string | undefined): void {
+		const who = scope.kind === "head" ? "head" : `worker ${this.#records.get(scope.challengeId)?.name ?? scope.challengeId}`;
+		this.#emit({
+			kind: "help",
+			tone: answer === undefined ? "warning" : "info",
+			title: `${who} asked for help`,
+			lines: [answer === undefined ? "No answer (dismissed or no TUI)." : `Your answer: ${answer}`],
+			untrusted: question,
+		});
+	}
+
+	#emit(event: Omit<CtfEvent, "eventId">): void {
+		try {
+			this.#deps.onEvent({ ...event, eventId: this.eventId });
+		} catch {
+			// Reporting must never break the run.
+		}
 	}
 
 	progress(scope: Scope, line: string): void {
@@ -266,6 +332,16 @@ export class CtfRun implements ToolHost {
 		this.signInConfirmed = true;
 		void this.#persist().catch(() => {});
 		this.phase = "running";
+		this.#emit({
+			kind: "started",
+			tone: "info",
+			title: `Run started: ${this.eventName}`,
+			lines: [
+				`URL: ${url}`,
+				`Head: ${modelSelector(this.headModel)}`,
+				`Workers: ${this.workerModels.map(modelSelector).join(", ")} (max ${this.#semaphore.max} at once, auto-submit ${this.autoSubmit() ? "on" : "off"})`,
+			],
+		});
 		this.#headPromise ??= this.#runHead();
 		this.#scheduleStatus();
 		return this.#headPromise;
@@ -298,6 +374,14 @@ export class CtfRun implements ToolHost {
 			done: Promise.resolve(),
 		};
 		this.#records.set(id, record);
+		// Report before the worker starts so the transcript order matches what happened.
+		this.#emit({
+			kind: "dispatched",
+			tone: "info",
+			title: `Dispatched ${record.name} (${id})`,
+			lines: request.url ? [`URL: ${request.url}`] : [],
+			untrusted: request.description ? capText(request.description, 2000) : undefined,
+		});
 		record.done = this.#runWorker(record);
 		await this.#persist();
 		this.#scheduleStatus();
@@ -318,6 +402,7 @@ export class CtfRun implements ToolHost {
 	/** Idempotent: abort sessions/dialogs, remove this event's containers, keep volumes/profile. */
 	stop(): Promise<void> {
 		this.#stopPromise ??= (async () => {
+			const wasActive = this.signInConfirmed;
 			this.#controller.abort();
 			this.phase = "stopped";
 			await Promise.allSettled([...this.#sessions].map(session => session.abort()));
@@ -330,29 +415,43 @@ export class CtfRun implements ToolHost {
 				await this.#persist().catch(() => {});
 				clearTimeout(this.#statusTimer);
 				this.#emitStatus();
+				if (wasActive) {
+					this.#emit({ kind: "stopped", tone: "info", title: `Run stopped: ${this.eventName}`, lines: [...this.#resultLines(), "Containers removed; volumes and browser profile kept."] });
+				}
 			}
 		})();
 		return this.#stopPromise;
 	}
 
-	statusLines(): string[] {
-		const lines = [
-			`CTF ${this.eventName} [${this.eventId}] — ${this.phase}`,
-			`URL: ${this.url || "(not known until you confirm sign-in)"}`,
-			`Head: ${modelSelector(this.headModel)} · Workers: ${this.workerModels.map(modelSelector).join(", ")}`,
-			`Sign-in confirmed: ${this.signInConfirmed ? "yes" : "no"} · Running workers: ${this.runningWorkers}/${this.#semaphore.max} · Auto-submit: ${this.autoSubmit() ? "on" : "off"}`,
-		];
-		if (this.noVncUrl) lines.push(`Browser (noVNC, loopback only): ${this.noVncUrl}`);
-		if (this.headActivity) lines.push(`Head: ${this.headActivity}`);
-		if (this.headError) lines.push(`Head error: ${this.headError.slice(0, 200)}`);
-		const records = [...this.#records.values()];
-		for (const record of records.slice(0, 12)) {
-			const detail = record.error ?? record.activity ?? "";
-			lines.push(`  ${record.id} ${record.status.padEnd(9)} ${record.name.slice(0, 40)}${detail ? ` — ${detail.slice(0, 60)}` : ""}`);
-		}
-		if (records.length > 12) lines.push(`  … ${records.length - 12} more`);
-		lines.push(`Network: ${NETWORK_WARNING}`);
-		return lines;
+	/** Structured snapshot for rendering. */
+	view(): RunView {
+		return {
+			eventId: this.eventId,
+			eventName: this.eventName,
+			phase: this.phase,
+			url: this.url,
+			headModel: modelSelector(this.headModel),
+			workerModels: this.workerModels.map(modelSelector),
+			signInConfirmed: this.signInConfirmed,
+			running: this.runningWorkers,
+			maxWorkers: this.#semaphore.max,
+			autoSubmit: this.autoSubmit(),
+			noVncUrl: this.noVncUrl,
+			headActivity: this.headActivity,
+			headError: this.headError,
+			challenges: [...this.#records.values()].map(record => ({
+				id: record.id,
+				name: record.name,
+				status: record.status,
+				model: record.model,
+				detail: (record.status === "running" ? record.activity : record.error)?.slice(0, 120),
+			})),
+		};
+	}
+
+	/** One line per challenge for event summaries. */
+	#resultLines(): string[] {
+		return [...this.#records.values()].map(record => `${record.id} ${record.name}: ${record.status}${record.model ? ` (${record.model})` : ""}`);
 	}
 
 	#scheduleStatus(): void {
@@ -364,7 +463,7 @@ export class CtfRun implements ToolHost {
 	}
 
 	#emitStatus(): void {
-		this.#deps.onStatus(this.statusLines());
+		this.#deps.onStatus(this.view());
 	}
 
 	async #persist(): Promise<void> {
@@ -383,7 +482,7 @@ export class CtfRun implements ToolHost {
 	}
 
 	/** Create one isolated SDK session and verify the admitted tool set and model before use. */
-	async #createSession(model: Model, tools: ToolDefinition[], toolNames: readonly string[], systemPrompt: string, agentId: string): Promise<AgentSession> {
+	async #createSession(model: Model, tools: CustomTool[], toolNames: readonly string[], systemPrompt: string, agentId: string): Promise<AgentSession> {
 		const { sdk, modelRegistry, sessionCwd } = this.#deps;
 		let settings: Settings;
 		try {
@@ -437,30 +536,50 @@ export class CtfRun implements ToolHost {
 		return session;
 	}
 
-	#watch(session: AgentSession, scope: Scope): () => void {
-		return session.subscribe(event => {
+	/** Track progress and tool outcomes for one session. */
+	#watch(session: AgentSession, scope: Scope): { stats: ToolStats; unsubscribe: () => void } {
+		const stats: ToolStats = { ok: 0, failed: 0 };
+		const unsubscribe = session.subscribe(event => {
 			if (event.type === "tool_execution_start") this.progress(scope, `→ ${event.toolName}`);
-			else if (event.type === "agent_end") this.progress(scope, "idle");
+			else if (event.type === "tool_execution_end") {
+				if (event.isError) {
+					stats.failed++;
+					stats.firstError ??= `${event.toolName}: ${toolResultText(event.result)}`;
+				} else stats.ok++;
+			} else if (event.type === "agent_end") this.progress(scope, "idle");
 		});
+		return { stats, unsubscribe };
 	}
 
 	async #runHead(): Promise<void> {
 		let session: AgentSession | undefined;
-		let unsubscribe: (() => void) | undefined;
+		let watch: { stats: ToolStats; unsubscribe: () => void } | undefined;
 		try {
 			session = await this.#createSession(this.headModel, createHeadTools(this.#deps.z, this), HEAD_TOOL_NAMES, headSystemPrompt(), "ctf-head");
-			unsubscribe = this.#watch(session, { kind: "head" });
+			watch = this.#watch(session, { kind: "head" });
 			await session.prompt(headTask(this.eventName, this.url));
 			await session.waitForIdle();
+			const outcome = classifyHeadOutcome(session, watch.stats);
+			this.headSummary = outcome.summary;
 			await Promise.allSettled([...this.#records.values()].map(record => record.done));
-			if (!this.signal.aborted) this.phase = "finished";
+			if (this.signal.aborted) return;
+			this.phase = outcome.phase;
+			this.headError = outcome.error;
+			this.#emit({
+				kind: outcome.phase,
+				tone: outcome.phase === "failed" ? "error" : "success",
+				title: outcome.phase === "failed" ? `Run failed: ${this.eventName}` : `Run finished: ${this.eventName}`,
+				lines: [...(outcome.error ? [`Reason: ${outcome.error}`] : []), ...this.#resultLines()],
+				untrusted: outcome.summary ? `Head summary:\n${capText(outcome.summary, 6000)}` : undefined,
+			});
 		} catch (error) {
 			if (!this.signal.aborted) {
 				this.phase = "failed";
 				this.headError = (error as Error).message;
+				this.#emit({ kind: "failed", tone: "error", title: `Run failed: ${this.eventName}`, lines: [`Reason: ${this.headError}`, ...this.#resultLines()] });
 			}
 		} finally {
-			unsubscribe?.();
+			watch?.unsubscribe();
 			if (session) {
 				this.#sessions.delete(session);
 				await session.dispose().catch(() => {});
@@ -472,7 +591,7 @@ export class CtfRun implements ToolHost {
 	async #runWorker(record: ChallengeRecord): Promise<void> {
 		let release: (() => void) | undefined;
 		let session: AgentSession | undefined;
-		let unsubscribe: (() => void) | undefined;
+		let watch: { stats: ToolStats; unsubscribe: () => void } | undefined;
 		try {
 			release = await this.#semaphore.acquire(this.signal);
 			record.status = "running";
@@ -484,10 +603,13 @@ export class CtfRun implements ToolHost {
 			const model = this.workerModels[this.#nextWorker++ % this.workerModels.length] as Model;
 			record.model = modelSelector(model);
 			session = await this.#createSession(model, createWorkerTools(this.#deps.z, this, record.id), WORKER_TOOL_NAMES, workerSystemPrompt(), `ctf-${record.id}`);
-			unsubscribe = this.#watch(session, { kind: "worker", challengeId: record.id });
+			watch = this.#watch(session, { kind: "worker", challengeId: record.id });
 			await session.prompt(workerTask(this.eventName, record));
 			await session.waitForIdle();
-			const outcome = classifyWorkerOutcome(session, this.signal.aborted);
+			let outcome = classifyWorkerOutcome(session, this.signal.aborted);
+			if (outcome.status === "done" && watch.stats.ok === 0 && watch.stats.failed > 0) {
+				outcome = { status: "failed", text: `Every tool call failed (${watch.stats.failed}). First error: ${watch.stats.firstError}` };
+			}
 			// markSubmitted() may have changed the status while the session ran.
 			const submitted = (record.status as ChallengeStatus) === "submitted";
 			record.status = submitted && outcome.status === "done" ? "submitted" : outcome.status;
@@ -497,7 +619,17 @@ export class CtfRun implements ToolHost {
 			record.status = this.signal.aborted ? "cancelled" : "failed";
 			record.error = capText((error as Error).message, 4096);
 		} finally {
-			unsubscribe?.();
+			watch?.unsubscribe();
+			if (!this.signal.aborted || record.status !== "cancelled") {
+				const tone = record.status === "failed" ? "error" : record.status === "refused" ? "warning" : record.status === "cancelled" ? "info" : "success";
+				this.#emit({
+					kind: "worker",
+					tone,
+					title: `${record.name} (${record.id}): ${record.status}`,
+					lines: record.model ? [`Worker model: ${record.model}`] : [],
+					untrusted: record.result ?? record.error,
+				});
+			}
 			if (session) {
 				this.#sessions.delete(session);
 				await session.dispose().catch(() => {});

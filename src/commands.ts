@@ -7,6 +7,7 @@ import { challengeVolumeName, Docker } from "./docker.ts";
 import { CtfRun, type Model, modelSelector, NETWORK_WARNING, type Sdk } from "./runtime.ts";
 import { callBrowser, type Zod } from "./tools.ts";
 import { assertEventId, assertHttpUrl, newEventId, ValidationError } from "./validate.ts";
+import { type CtfEvent, statusComponent, statusShort, statusText } from "./view.ts";
 
 export interface ControllerDeps {
 	sdk: Sdk;
@@ -15,6 +16,8 @@ export interface ControllerDeps {
 	store?: CtfStore;
 	/** Opens a URL in the operator's browser; resolves false when it could not. */
 	openUrl?: (url: string) => Promise<boolean>;
+	/** Posts run events into the main OMP session (transcript + model context). */
+	post?: (event: CtfEvent) => void;
 }
 
 export const USAGE = [
@@ -157,10 +160,11 @@ export class CtfController {
 					ui,
 					hostPaths: [homedir(), ctx.cwd, fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, ""), this.store.root],
 					sessionCwd: await this.store.emptyCwd(),
-					onStatus: lines => {
-						ui.setWidget("ctf", lines);
-						ui.setStatus("ctf", lines[0]);
+					onStatus: view => {
+						ui.setWidget("ctf", (_tui, theme) => statusComponent(view, theme));
+						ui.setStatus("ctf", ui.theme.fg("accent", statusShort(view)));
 					},
+					onEvent: event => this.#deps.post?.(event),
 				},
 				{ eventId, eventName, headModel: head, workerModels, config },
 			);
@@ -204,7 +208,7 @@ export class CtfController {
 			ctx.ui.notify("No active CTF run.", "info");
 			return;
 		}
-		ctx.ui.notify(run.statusLines().join("\n"), "info");
+		ctx.ui.notify(statusText(run.view()), "info");
 	}
 
 	async stop(ctx: ExtensionCommandContext): Promise<void> {

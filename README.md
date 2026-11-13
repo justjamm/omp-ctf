@@ -4,7 +4,7 @@ Oh My Pi plugin that adds `/ctf`: containerized, operator-supervised automation 
 
 Design notes: [CTF-Plugin-Plan wiki page](https://github.com/justjamm/omp-ctf/wiki/CTF-Plugin-Plan). VM testing guide: [VM-Test-Handoff](https://github.com/justjamm/omp-ctf/wiki/VM-Test-Handoff).
 
-**Status:** unit tests and typecheck pass, and the isolated head/worker sessions were checked against the real OMP 18.20.0 SDK. On macOS (Colima) the setup script, both image builds, the browser container (loopback-only noVNC with token enforcement, no CDP), driver navigate/observe/screenshot/download, the download broker, and challenge-container hardening have been verified. A full model-driven `/ctf` run against a real CTF site has **not** been exercised yet.
+**Status:** unit tests (including a contract test against the real OMP 18.20.0 tool adapter) and typecheck pass. On macOS (Colima) the setup script, both image builds, the browser container (loopback-only noVNC with token enforcement, no CDP), driver navigate/observe/screenshot/download, the download broker, and challenge-container hardening have been verified, and a real head model (with Docker faked) has enumerated challenges and dispatched real worker models. A complete run against a real CTF site after the tool-calling fix has **not** been exercised yet.
 
 **Supported hosts:** macOS and Linux (apt- or dnf-based). Windows is not supported.
 
@@ -56,6 +56,24 @@ omp plugin link .
 Only one run is active per OMP process; starting another tells you to stop the first. Exiting OMP stops containers without deleting data.
 
 The plugin never navigates for you before you answer. When you answer **Yes**, it reads the page the browser is showing (if you signed in on a new tab, that tab is used) and gives that URL to the head. If the browser isn't on an http(s) page, it asks again.
+
+## Run reports in your OMP session
+
+While a run is active, a status widget above the editor shows the event, phase, head model, running workers and each challenge (`○` queued, `◐` running, `✓` done, `⚑` submitted, `⊘` refused, `✗` failed). The footer shows a one-line summary.
+
+Key run events are also posted into your normal OMP session as `⚑ CTF` messages:
+- run started
+- each challenge dispatched
+- each worker's result
+- flags submitted
+- help requests and your answers
+- run finished, failed or stopped, with the head's summary
+
+Each message appears in the transcript and in your normal model's context, without starting a turn, so you can ask questions like "what did the worker find for Task 1?" or "why did the run fail?".
+
+Text that comes from the website, challenge files or the CTF models is fenced and marked as untrusted data. Note, though, that your normal session has your usual host tools: treat CTF output like any untrusted input before asking that model to act on it.
+
+If the head errors, or none of its tool calls succeed, the run ends as **failed** with the reason, never a silent "finished".
 
 ## Models: head vs. workers
 

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
-import { CtfRun, ISOLATED_SETTINGS, type Sdk } from "../src/runtime.ts";
+import { CtfRun, classifyHeadOutcome, ISOLATED_SETTINGS, type Sdk } from "../src/runtime.ts";
+import type { CtfEvent } from "../src/view.ts";
 import { HEAD_TOOL_NAMES, WORKER_TOOL_NAMES } from "../src/tools.ts";
 import { FakeDockerCli, type FakeSession, fakeSdk, fakeUi, model, ok, tempStore, zod } from "./fakes.ts";
 
@@ -36,8 +37,20 @@ class Gates {
 async function makeRun(opts: { sdk: Sdk; ui?: ExtensionUIContext; maxWorkers?: number; autoSubmit?: boolean; cli?: FakeDockerCli }) {
 	const cli = opts.cli ?? new FakeDockerCli();
 	const store = await tempStore();
+	const events: CtfEvent[] = [];
 	const run = new CtfRun(
-		{ sdk: opts.sdk, z: zod, docker: cli.docker, store, modelRegistry: { authStorage: {} } as never, ui: opts.ui, hostPaths: ["/Users/op"], sessionCwd: store.root, onStatus: () => {} },
+		{
+			sdk: opts.sdk,
+			z: zod,
+			docker: cli.docker,
+			store,
+			modelRegistry: { authStorage: {} } as never,
+			ui: opts.ui,
+			hostPaths: ["/Users/op"],
+			sessionCwd: store.root,
+			onStatus: () => {},
+			onEvent: event => events.push(event),
+		},
 		{
 			eventId: "evt-abc123",
 			eventName: "Test CTF",
@@ -47,13 +60,11 @@ async function makeRun(opts: { sdk: Sdk; ui?: ExtensionUIContext; maxWorkers?: n
 		},
 	);
 	await run.startInfrastructure(() => {});
-	return { run, cli, store };
+	return { run, cli, store, events };
 }
 
 function tool(session: FakeSession, name: string) {
-	const found = session.tools.find(t => t.name === name);
-	if (!found) throw new Error(`no tool ${name}`);
-	return (params: Record<string, unknown>) => found.execute("call", params, undefined, undefined, {});
+	return (params: Record<string, unknown>) => session.call(name, params);
 }
 
 const driverCalls = (cli: FakeDockerCli) => cli.calls.filter(c => c.argv.includes("/opt/ctf-driver/driver.mjs"));
@@ -65,7 +76,7 @@ describe("model separation", () => {
 		expect(
 			() =>
 				new CtfRun(
-					{ sdk, z: zod, docker: new FakeDockerCli().docker, store, modelRegistry: {} as never, ui: undefined, hostPaths: [], sessionCwd: store.root, onStatus: () => {} },
+					{ sdk, z: zod, docker: new FakeDockerCli().docker, store, modelRegistry: {} as never, ui: undefined, hostPaths: [], sessionCwd: store.root, onStatus: () => {}, onEvent: () => {} },
 					{ eventId: "evt-abc123", eventName: "x", headModel: HEAD, workerModels: [HEAD], config: { version: 1, workerModels: [], autoSubmit: false, maxWorkers: 1 } },
 				),
 		).toThrow(/must not also be a worker/);
@@ -258,5 +269,63 @@ describe("cancellation", () => {
 		await run.dispatch({ name: "q" });
 		await run.waitFor(undefined, 5000, run.signal);
 		expect(message).toMatch(/NOT asked/);
+	});
+});
+
+describe("run outcome and main-session events", () => {
+	test("a head whose every tool call fails ends as failed with the first error, not finished", async () => {
+		const { sdk } = fakeSdk(async session => {
+			for (let i = 0; i < 3; i++) await session.call("ctf_browser", { op: "navigate", url: "file:///etc/passwd" }).catch(() => {});
+			session.lastText = "The tools are broken.";
+		});
+		const { run, events } = await makeRun({ sdk });
+		await run.beginHead("https://ctf.test/");
+		expect(run.phase).toBe("failed");
+		expect(run.headError).toMatch(/None of the head's 3 tool calls succeeded.*ctf_browser: .*not allowed/);
+		const failed = events.find(e => e.kind === "failed")!;
+		expect(failed.lines.join("\n")).toContain("None of the head's 3 tool calls succeeded");
+		expect(failed.untrusted).toContain("The tools are broken.");
+	});
+
+	test("a provider error in the head is reported as the failure reason", () => {
+		const outcome = classifyHeadOutcome(
+			{ messages: [{ role: "assistant", stopReason: "error", errorMessage: "Unsupported service_tier: flex" }] as never, getLastAssistantText: () => undefined },
+			{ ok: 0, failed: 0 },
+		);
+		expect(outcome).toEqual({ phase: "failed", error: "Head model error: Unsupported service_tier: flex", summary: "" });
+	});
+
+	test("events tell the main session what happened, with model/site output marked untrusted", async () => {
+		const { sdk } = fakeSdk(async (session, text) => {
+			if (session.model === HEAD) {
+				await session.call("ctf_dispatch", { action: "start", name: "pwn1", description: "Exploit the service" });
+				await session.call("ctf_dispatch", { action: "wait", timeoutSec: 5 });
+				session.lastText = "pwn1 solved by the worker.";
+			} else {
+				session.lastText = `Found flag{demo} for ${/Challenge: (.*)/.exec(text)?.[1]}`;
+			}
+		});
+		const { run, events } = await makeRun({ sdk });
+		await run.beginHead("https://ctf.test/");
+		expect(run.phase).toBe("finished");
+		expect(events.map(e => e.kind)).toEqual(["started", "dispatched", "worker", "finished"]);
+		expect(events[0]!.lines.join("\n")).toContain("Head: abl/head-model");
+		expect(events[1]!.untrusted).toBe("Exploit the service");
+		expect(events[2]).toMatchObject({ tone: "success", untrusted: "Found flag{demo} for pwn1" });
+		expect(events[3]!.untrusted).toContain("pwn1 solved by the worker.");
+		expect(events.every(e => e.eventId === "evt-abc123")).toBe(true);
+	});
+
+	test("a confirmed submission is reported with its flag", async () => {
+		const { ui } = fakeUi({ confirm: () => true });
+		const cli = new FakeDockerCli();
+		const { sdk } = fakeSdk(async session => {
+			await session.call("ctf_submit_flag", { flag: "flag{x}", inputSelector: "#flag", submitSelector: "#go" });
+		});
+		const { run, events } = await makeRun({ sdk, ui, cli });
+		await run.dispatch({ name: "crypto1" });
+		await run.waitFor(undefined, 5000, run.signal);
+		const submitted = events.find(e => e.kind === "submitted")!;
+		expect(submitted.lines).toContain("Flag: flag{x}");
 	});
 });

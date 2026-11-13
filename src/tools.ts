@@ -3,7 +3,7 @@
  * containers, volumes and page ids resolve from host-owned state. All page/challenge output is
  * returned as ordinary (untrusted) tool results, never as system/developer context.
  */
-import type { AgentToolResult, ExtensionAPI, ExtensionUIContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import type { AgentToolResult, CustomTool, ExtensionAPI, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent";
 import type { Docker } from "./docker.ts";
 import {
 	assertChallengeId,
@@ -60,7 +60,9 @@ export interface ToolHost {
 	/** Interactive TUI of the active /ctf command, or undefined when none is available. */
 	ui(): ExtensionUIContext | undefined;
 	challenge(id: string): ChallengeHandle | undefined;
-	markSubmitted(id: string): void;
+	markSubmitted(id: string, flag: string): void;
+	/** Record a help request and the operator's answer (undefined when not answered). */
+	noteQuestion(scope: Scope, question: string, answer: string | undefined): void;
 	dispatch(request: DispatchRequest): Promise<{ challengeId: string }>;
 	summaries(): ChallengeSummary[];
 	waitFor(ids: string[] | undefined, timeoutMs: number, signal: AbortSignal): Promise<ChallengeSummary[]>;
@@ -174,7 +176,7 @@ export function buildBrowserRequest(params: BrowserParams, scope: Scope): Record
 	return request;
 }
 
-export function createBrowserTool(z: Zod, host: ToolHost, scope: Scope): ToolDefinition {
+export function createBrowserTool(z: Zod, host: ToolHost, scope: Scope): CustomTool {
 	return {
 		name: "ctf_browser",
 		label: "CTF browser",
@@ -197,7 +199,7 @@ export function createBrowserTool(z: Zod, host: ToolHost, scope: Scope): ToolDef
 			timeoutMs: z.number().optional().describe("Default 30000, max 120000"),
 			fullPage: z.boolean().optional(),
 		}),
-		async execute(_id, params, signal, onUpdate) {
+		async execute(_id, params, onUpdate, _ctx, signal) {
 			const request = buildBrowserRequest(params as BrowserParams, scope);
 			const linked = linkSignals(signal, host);
 			host.progress(scope, `browser ${request.op}`);
@@ -224,7 +226,7 @@ interface ExecParams {
 	timeoutSec?: number;
 }
 
-export function createExecTool(z: Zod, host: ToolHost, scope: Extract<Scope, { kind: "worker" }>): ToolDefinition {
+export function createExecTool(z: Zod, host: ToolHost, scope: Extract<Scope, { kind: "worker" }>): CustomTool {
 	return {
 		name: "ctf_exec",
 		label: "CTF exec",
@@ -242,7 +244,7 @@ export function createExecTool(z: Zod, host: ToolHost, scope: Extract<Scope, { k
 			stdin: z.string().optional(),
 			timeoutSec: z.number().optional(),
 		}),
-		async execute(_id, raw, signal, onUpdate) {
+		async execute(_id, raw, onUpdate, _ctx, signal) {
 			const params = raw as ExecParams;
 			if ((params.argv === undefined) === (params.shell === undefined)) throw new ValidationError("Provide exactly one of argv or shell");
 			const argv = params.argv !== undefined ? assertExecArgv(params.argv, host.hostPaths) : ["bash", "-lc", String(params.shell)];
@@ -272,7 +274,7 @@ interface SubmitParams {
 	challengeId?: string;
 }
 
-export function createSubmitTool(z: Zod, host: ToolHost, scope: Scope): ToolDefinition {
+export function createSubmitTool(z: Zod, host: ToolHost, scope: Scope): CustomTool {
 	return {
 		name: "ctf_submit_flag",
 		label: "CTF submit flag",
@@ -285,7 +287,7 @@ export function createSubmitTool(z: Zod, host: ToolHost, scope: Scope): ToolDefi
 			submitSelector: z.string(),
 			challengeId: z.string().optional().describe("Required for the head; workers are bound to their challenge"),
 		}),
-		async execute(_id, raw, signal) {
+		async execute(_id, raw, _onUpdate, _ctx, signal) {
 			const params = raw as SubmitParams;
 			if (typeof params.flag !== "string" || params.flag.trim().length === 0 || params.flag.length > 1000) throw new ValidationError("flag must be a non-empty string");
 			const flag = params.flag.trim();
@@ -309,13 +311,13 @@ export function createSubmitTool(z: Zod, host: ToolHost, scope: Scope): ToolDefi
 			}
 			host.progress(scope, `submit flag for ${handle.id}`);
 			const result = await callBrowser(host, request, linked, request.timeoutMs);
-			host.markSubmitted(handle.id);
+			host.markSubmitted(handle.id, flag);
 			return text(`Submitted. ${UNTRUSTED}\n${JSON.stringify(result, null, 1)}`, { submitted: true });
 		},
 	};
 }
 
-export function createAskUserTool(z: Zod, host: ToolHost, scope: Scope): ToolDefinition {
+export function createAskUserTool(z: Zod, host: ToolHost, scope: Scope): CustomTool {
 	return {
 		name: "ctf_ask_user",
 		label: "CTF ask operator",
@@ -326,18 +328,23 @@ export function createAskUserTool(z: Zod, host: ToolHost, scope: Scope): ToolDef
 			question: z.string(),
 			options: z.array(z.string()).optional(),
 		}),
-		async execute(_id, raw, signal) {
+		async execute(_id, raw, _onUpdate, _ctx, signal) {
 			const { question, options } = raw as { question: string; options?: string[] };
 			if (typeof question !== "string" || question.trim().length === 0 || question.length > 4000) throw new ValidationError("question must be a non-empty string up to 4000 chars");
 			const ui = host.ui();
-			if (!ui) throw new Error("No interactive TUI is available; the operator was NOT asked.");
+			if (!ui) {
+				host.noteQuestion(scope, question, undefined);
+				throw new Error("No interactive TUI is available; the operator was NOT asked.");
+			}
 			const who = scope.kind === "head" ? "head" : `worker ${scope.challengeId}`;
 			const linked = linkSignals(signal, host);
 			ui.notify(`CTF ${who} needs help: ${question.slice(0, 200)}`, "warning");
 			const title = `[CTF ${who}] ${question}`;
 			const cleanOptions = (options ?? []).filter(o => typeof o === "string" && o.length > 0 && o.length <= 200).slice(0, 20);
 			const answer = cleanOptions.length > 0 ? await ui.select(title, cleanOptions, { signal: linked }) : await ui.input(title, "Type your answer", { signal: linked });
-			if (answer === undefined || linked.aborted) return text("The operator dismissed the question without answering.", { answered: false });
+			const answered = answer !== undefined && !linked.aborted;
+			host.noteQuestion(scope, question, answered ? answer : undefined);
+			if (!answered) return text("The operator dismissed the question without answering.", { answered: false });
 			return text(`Operator answer: ${answer}`, { answered: true });
 		},
 	};
@@ -352,7 +359,7 @@ interface DispatchParams {
 	timeoutSec?: number;
 }
 
-export function createDispatchTool(z: Zod, host: ToolHost): ToolDefinition {
+export function createDispatchTool(z: Zod, host: ToolHost): CustomTool {
 	return {
 		name: "ctf_dispatch",
 		label: "CTF dispatch",
@@ -371,7 +378,7 @@ export function createDispatchTool(z: Zod, host: ToolHost): ToolDefinition {
 			challengeIds: z.array(z.string()).optional(),
 			timeoutSec: z.number().optional(),
 		}),
-		async execute(_id, raw, signal) {
+		async execute(_id, raw, _onUpdate, _ctx, signal) {
 			const params = raw as DispatchParams;
 			const linked = linkSignals(signal, host);
 			if (params.action === "start") {
@@ -393,12 +400,12 @@ export function createDispatchTool(z: Zod, host: ToolHost): ToolDefinition {
 	};
 }
 
-export function createHeadTools(z: Zod, host: ToolHost): ToolDefinition[] {
+export function createHeadTools(z: Zod, host: ToolHost): CustomTool[] {
 	const scope: Scope = { kind: "head" };
 	return [createBrowserTool(z, host, scope), createSubmitTool(z, host, scope), createAskUserTool(z, host, scope), createDispatchTool(z, host)];
 }
 
-export function createWorkerTools(z: Zod, host: ToolHost, challengeId: string): ToolDefinition[] {
+export function createWorkerTools(z: Zod, host: ToolHost, challengeId: string): CustomTool[] {
 	const scope = { kind: "worker", challengeId: assertChallengeId(challengeId) } as const;
 	return [createBrowserTool(z, host, scope), createExecTool(z, host, scope), createSubmitTool(z, host, scope), createAskUserTool(z, host, scope)];
 }
