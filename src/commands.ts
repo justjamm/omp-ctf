@@ -395,8 +395,16 @@ function describeConfig(config: CtfConfig): string {
 async function pickModel(ui: ExtensionUIContext, title: string, models: Model[], exclude: string[]): Promise<Model | undefined> {
 	const candidates = models.filter(model => !exclude.includes(modelSelector(model)));
 	if (candidates.length === 0) throw new Error("No authenticated models are available. Log in to a provider first.");
-	const choice = await ui.select(title, candidates.map(modelSelector));
-	return candidates.find(model => modelSelector(model) === choice);
+	// Sort with abliterated models first (they're the recommended head choice), then alphabetically.
+	const sorted = [...candidates].sort((a, b) => {
+		const aAbliterated = a.provider.toLowerCase().includes("abliteration");
+		const bAbliterated = b.provider.toLowerCase().includes("abliteration");
+		if (aAbliterated && !bAbliterated) return -1;
+		if (!aAbliterated && bAbliterated) return 1;
+		return modelSelector(a).localeCompare(modelSelector(b));
+	});
+	const choice = await ui.select(title, sorted.map(modelSelector));
+	return sorted.find(model => modelSelector(model) === choice);
 }
 
 /** Repeated selection of one or more standard worker models. Undefined when dismissed with none. */
