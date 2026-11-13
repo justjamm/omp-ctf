@@ -19,6 +19,7 @@ import {
 	MAX_TEXT_BYTES,
 	ValidationError,
 } from "./validate.ts";
+import { wrap } from "./view.ts";
 
 export type Zod = ExtensionAPI["zod"];
 
@@ -258,9 +259,12 @@ export function createExecTool(z: Zod, host: ToolHost, scope: Extract<Scope, { k
 		}),
 		async execute(_id, raw, onUpdate, _ctx, signal) {
 			const params = raw as ExecParams;
-			if ((params.argv === undefined) === (params.shell === undefined)) throw new ValidationError("Provide exactly one of argv or shell");
-			const argv = params.argv !== undefined ? assertExecArgv(params.argv, host.hostPaths) : ["bash", "-lc", String(params.shell)];
-			if (params.shell !== undefined && (params.shell.length === 0 || params.shell.includes("\0") || params.shell.length > 100_000)) throw new ValidationError("Invalid shell script");
+			// Models sometimes send argv: [] or shell: "" alongside the real value; treat empty as absent.
+			const argvParam = Array.isArray(params.argv) ? params.argv : [];
+			const shell = typeof params.shell === "string" && params.shell.length > 0 ? params.shell : undefined;
+			if (argvParam.length > 0 === (shell !== undefined)) throw new ValidationError("Provide exactly one of argv or shell");
+			if (shell !== undefined && (shell.includes("\0") || shell.length > 100_000)) throw new ValidationError("Invalid shell script");
+			const argv = argvParam.length > 0 ? assertExecArgv(argvParam, host.hostPaths) : ["bash", "-lc", shell ?? ""];
 			const cwd = params.cwd === undefined ? undefined : assertWorkspaceRelative(params.cwd);
 			if (params.stdin !== undefined && Buffer.byteLength(params.stdin) > MAX_TEXT_BYTES) throw new ValidationError("stdin exceeds 1 MiB");
 			const timeoutSec = clampExecTimeoutSec(params.timeoutSec);
@@ -317,7 +321,7 @@ export function createSubmitTool(z: Zod, host: ToolHost, scope: Scope): CustomTo
 				const ui = host.ui();
 				if (!ui) return text("NOT SUBMITTED: auto-submit is off and no interactive TUI is available to confirm.", { submitted: false });
 				const approved = await ui
-					.confirm("Submit CTF flag?", `Event: ${host.eventName}\nChallenge: ${handle.name} (${handle.id})\nFlag: ${flag}`, { signal: linked })
+					.confirm("Submit CTF flag?", wrap(`Event: ${host.eventName}\nChallenge: ${handle.name} (${handle.id})\nFlag: ${flag}`, 80).join("\n"), { signal: linked })
 					.catch(() => false);
 				if (!approved || linked.aborted) return text("NOT SUBMITTED: the operator declined or the confirmation was cancelled. Do not retry this submission unless the operator asks.", { submitted: false });
 			}
@@ -351,7 +355,9 @@ export function createAskUserTool(z: Zod, host: ToolHost, scope: Scope): CustomT
 			const who = scope.kind === "head" ? "head" : `worker ${scope.challengeId}`;
 			const linked = linkSignals(signal, host);
 			ui.notify(`CTF ${who} needs help: ${question.slice(0, 200)}`, "warning");
-			const title = `[CTF ${who}] ${question}`;
+			// The native dialogs clip a single long title; the first line becomes the box title and
+			// the wrapped remainder renders as detail lines below it.
+			const title = [`[CTF ${who}] needs your help:`, ...wrap(question, 80)].join("\n");
 			const cleanOptions = (options ?? []).filter(o => typeof o === "string" && o.length > 0 && o.length <= 200).slice(0, 20);
 			const answer = cleanOptions.length > 0 ? await ui.select(title, cleanOptions, { signal: linked }) : await ui.input(title, "Type your answer", { signal: linked });
 			const answered = answer !== undefined && !linked.aborted;

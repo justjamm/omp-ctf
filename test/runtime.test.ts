@@ -203,6 +203,33 @@ describe("scheduling and isolation", () => {
 		expect(results.every(r => r !== "accepted")).toBe(true);
 		expect(cli.calls.filter(c => c.argv[1] === "exec")).toHaveLength(0);
 	});
+
+	test("empty argv or shell counts as absent, so argv: [] with a shell script works", async () => {
+		const { sdk } = fakeSdk(async session => {
+			await tool(session, "ctf_exec")({ argv: [], shell: "echo hi" });
+		});
+		const { run, cli } = await makeRun({ sdk });
+		await run.dispatch({ name: "x" });
+		await run.waitFor(undefined, 5000, run.signal);
+		const exec = cli.byCommand("exec").find(c => c.argv.includes("bash"));
+		expect(exec?.argv.slice(-3)).toEqual(["bash", "-lc", "echo hi"]);
+	});
+
+	test("ask_user wraps the question so no line is clipped by the dialog", async () => {
+		const { ui, log } = fakeUi({ select: () => "Fix tool schema and retry" });
+		const longQuestion = "The execution tool rejects calls with 'Provide exactly one of argv or shell', while its strict argument schema requires both fields (even empty argv/shell is rejected). Can you fix the tool schema so I can retry?";
+		const { sdk } = fakeSdk(async session => {
+			await tool(session, "ctf_ask_user")({ question: longQuestion, options: ["Fix tool schema and retry", "Reassign section"] });
+		});
+		const { run } = await makeRun({ sdk, ui });
+		await run.dispatch({ name: "q" });
+		await run.waitFor(undefined, 5000, run.signal);
+		const title = log.select[0]!.title;
+		const lines = title.split("\n");
+		expect(lines[0]).toMatch(/^\[CTF worker c-[a-f0-9]{8}\] needs your help:$/);
+		for (const line of lines) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(80);
+		expect(lines.join(" ")).toContain("Can you fix the tool schema");
+	});
 });
 
 describe("flag submission", () => {
