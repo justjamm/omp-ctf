@@ -252,6 +252,13 @@ with_docker docker info --format 'Docker server {{.ServerVersion}} ({{.Operating
 log "Installing omp-ctf dependencies"
 (cd "$ROOT" && bun install --frozen-lockfile)
 
+log "Checking that the image registries are reachable"
+for registry in mcr.microsoft.com registry-1.docker.io; do
+	if ! curl -sS -o /dev/null --max-time 20 "https://$registry/v2/" 2>/tmp/omp-ctf-registry.err; then
+		die "Cannot reach $registry ($(tr -d '\n' </tmp/omp-ctf-registry.err)). This is a DNS/network problem on this machine or VM: check 'getent hosts $registry' and /etc/resolv.conf (or the VM's network/DNS settings), then re-run."
+	fi
+done
+
 log "Building omp-ctf images (first run takes several minutes)"
 with_docker bun "$ROOT/scripts/build-images.ts"
 

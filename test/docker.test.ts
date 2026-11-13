@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { summarizeBuildFailure } from "../src/docker.ts";
 import { MAX_DOWNLOAD_BYTES } from "../src/validate.ts";
 import { FakeDockerCli, ok } from "./fakes.ts";
 
@@ -65,5 +66,32 @@ describe("containers", () => {
 		cli.pipeResult = { fromCode: 0, toCode: 0, bytes: MAX_DOWNLOAD_BYTES + 1, stderr: "", exceeded: true };
 		await expect(cli.docker.copyDownload("b", "/home/ctf/downloads/a.bin", "c")).rejects.toThrow(/exceeds/);
 		expect(cli.pipes[0]?.to).toEqual(["docker", "cp", "-", "c:/work/downloads"]);
+	});
+});
+
+describe("build failures", () => {
+	const KALI_LOG = [
+		'#0 building with "default" instance using docker driver',
+		"#1 [internal] load build definition from Dockerfile",
+		"#1 DONE 0.0s",
+		"#2 [internal] load metadata for mcr.microsoft.com/playwright:v1.65.0-noble",
+		'#2 ERROR: failed to do request: Head "https://mcr.microsoft.com/v2/playwright/manifests/v1.65.0-noble": dial tcp: lookup mcr.microsoft.com on 192.168.67.2:53: no such host',
+		"Dockerfile:3",
+		"   3 | >>> FROM mcr.microsoft.com/playwright:v1.65.0-noble",
+		'ERROR: failed to build: failed to solve: mcr.microsoft.com/playwright:v1.65.0-noble: failed to resolve source metadata for mcr.microsoft.com/playwright:v1.65.0-noble: failed to do request: Head "https://mcr.microsoft.com/v2/playwright/manifests/v1.65.0-noble": dial tcp: lookup mcr.microsoft.com on 192.168.67.2:53: no such host',
+	].join("\n");
+
+	test("DNS failure yields the final error plus a host-network hint, not the whole log", () => {
+		const message = summarizeBuildFailure("omp-ctf-browser:pw1.65.0-1", 1, KALI_LOG);
+		expect(message).toContain("cannot resolve mcr.microsoft.com");
+		expect(message).toContain("getent hosts mcr.microsoft.com");
+		expect(message).not.toContain("load build definition");
+		expect(message.split("\n").length).toBeLessThanOrEqual(4);
+	});
+
+	test("non-network failures carry no network hint", () => {
+		const message = summarizeBuildFailure("x", 1, "#5 ERROR: process \"/bin/sh -c apt-get install nope\" did not complete successfully: exit code: 100");
+		expect(message).toContain("exit code: 100");
+		expect(message).not.toMatch(/DNS|network/);
 	});
 });

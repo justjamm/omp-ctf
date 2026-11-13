@@ -169,6 +169,24 @@ function daemonHint(stderr: string): string {
 	return `The Docker daemon is unavailable: ${detail}. ${fix} Setup script: ${SETUP_SCRIPT}. No resources were created.`;
 }
 
+/**
+ * Short, actionable build error: the final `ERROR` lines instead of the whole BuildKit log, plus a
+ * hint when the failure is name resolution or registry reachability (a host/VM network problem).
+ */
+export function summarizeBuildFailure(tag: string, code: number, log: string): string {
+	const lines = log.split("\n").map(line => line.trim()).filter(Boolean);
+	const errors = lines.filter(line => /^(#\d+ )?ERROR\b/i.test(line) || /^ERROR:/i.test(line));
+	const detail = (errors.length > 0 ? errors.slice(-2) : lines.slice(-5)).join("\n");
+	const host = /lookup ([a-z0-9.-]+)(?: on [^:]+:\d+)?: (?:no such host|server misbehaving)|lookup ([a-z0-9.-]+).*(?:Temporary failure in name resolution|i\/o timeout)/i.exec(log);
+	const registry = host?.[1] ?? host?.[2];
+	const hint = registry
+		? `\nThe Docker host cannot resolve ${registry}. This is a DNS/network problem on this machine or VM, not in omp-ctf: check that \`getent hosts ${registry}\` works (fix /etc/resolv.conf or the VM's network/DNS settings), then retry.`
+		: /(?:dial tcp|TLS handshake timeout|connection refused|network is unreachable)/i.test(log)
+			? "\nThe Docker host cannot reach the image registry. Check this machine's network/proxy settings, then retry."
+			: "";
+	return `docker build ${tag} failed (exit ${code}):\n${detail}${hint}`;
+}
+
 export function browserContainerName(eventId: string): string {
 	return `omp-ctf-${assertEventId(eventId)}-browser`;
 }
@@ -251,7 +269,13 @@ export class Docker {
 	async ensureImage(tag: string, contextDir: string, signal?: AbortSignal, onProgress?: (line: string) => void): Promise<void> {
 		if (await this.imageExists(tag, signal)) return;
 		onProgress?.(`Building ${tag} (first run only)…`);
-		await this.must(["build", "--pull", "--label", "omp-ctf.image=1", "-t", tag, contextDir], { signal, timeoutMs: 30 * 60_000, maxOutputBytes: 256 * 1024 }, "build");
+		const result = await this.docker(["build", "--pull", "--label", "omp-ctf.image=1", "-t", tag, contextDir], {
+			signal,
+			timeoutMs: 30 * 60_000,
+			maxOutputBytes: 256 * 1024,
+		});
+		if (result.aborted) throw new DockerError(`docker build ${tag} aborted`, result);
+		if (result.code !== 0) throw new DockerError(summarizeBuildFailure(tag, result.code, `${result.stdout}\n${result.stderr}`), result);
 	}
 
 	async ensureVolume(name: string, labels: Record<string, string>, signal?: AbortSignal): Promise<void> {
