@@ -63,8 +63,8 @@ While a run is active, a status widget above the editor shows the event, phase, 
 
 Key run events are also posted into your normal OMP session as `⚑ CTF` messages:
 - run started
-- each challenge dispatched
-- each worker's result
+- each challenge dispatched, and each further section as the head continues it
+- each worker section's result (the widget also shows a section count per challenge)
 - flags submitted
 - help requests and your answers
 - run finished, failed or stopped, with the head's summary
@@ -78,9 +78,9 @@ If the head errors, or none of its tool calls succeed, the run ends as **failed*
 ## Models: head vs. workers
 
 - **Head**: chosen in the picker at every `/ctf`, never saved. You choose your abliterated coordinator model here; the plugin cannot verify model properties. The head can browse, dispatch, ask you, and submit flags; it **cannot** execute code.
-- **Workers**: one or more standard models saved in config. Each dispatched challenge gets one worker (round-robin), its own container and volume, and the tools `ctf_browser`, `ctf_exec`, `ctf_submit_flag`, `ctf_ask_user`.
+- **Workers**: one or more standard models saved in config. Each challenge is split into small sections; every section gets a fresh worker session (round-robin across your worker models, so consecutive sections of a challenge use different models), its own slice of the challenge's container and volume, and the tools `ctf_browser`, `ctf_exec`, `ctf_submit_flag`, `ctf_ask_user`. Downloaded files persist in the challenge container across sections, but each worker session only sees its own narrow goal and the head's brief notes — not the whole challenge, not other sections.
 - The head model may not also be a worker. Unavailable/unauthenticated models fail setup; there is no silent fallback, and cross-model retry fallback is disabled.
-- A worker refusal is reported as `refused` and is final for the run: it is never retried with the head model, and the head cannot re-dispatch it.
+- A worker refusal is reported as `refused` and is final for that challenge: it is never retried with the head model, and the head cannot re-dispatch it. Sectioning exists to keep each worker's job small; it does not bypass any model's safeguards.
 
 Every CTF session is an isolated in-memory SDK session: no transcripts persisted, no memory, skills, rules, context files, MCP, LSP, extensions or project context, and a restricted allowlist of only the `ctf_*` tools. Your ordinary OMP session keeps its normal model and tools.
 

@@ -35,6 +35,15 @@ export interface DispatchRequest {
 	name: string;
 	url?: string;
 	description?: string;
+	/** First section's narrow objective; when absent the worker solves the whole challenge. */
+	goal?: string;
+}
+
+/** The next section of an existing challenge: a fresh worker session on the same container/volume. */
+export interface ContinueRequest {
+	challengeId: string;
+	goal: string;
+	notes?: string;
 }
 
 export interface ChallengeSummary {
@@ -42,6 +51,7 @@ export interface ChallengeSummary {
 	name: string;
 	status: string;
 	model?: string;
+	sections?: number;
 	result?: string;
 	error?: string;
 }
@@ -64,6 +74,8 @@ export interface ToolHost {
 	/** Record a help request and the operator's answer (undefined when not answered). */
 	noteQuestion(scope: Scope, question: string, answer: string | undefined): void;
 	dispatch(request: DispatchRequest): Promise<{ challengeId: string }>;
+	/** Queue the next section of a finished challenge (fresh worker session, same container/volume). */
+	continueSection(request: ContinueRequest): Promise<{ challengeId: string }>;
 	summaries(): ChallengeSummary[];
 	waitFor(ids: string[] | undefined, timeoutMs: number, signal: AbortSignal): Promise<ChallengeSummary[]>;
 	progress(scope: Scope, line: string): void;
@@ -351,10 +363,13 @@ export function createAskUserTool(z: Zod, host: ToolHost, scope: Scope): CustomT
 }
 
 interface DispatchParams {
-	action: "start" | "status" | "wait";
+	action: "start" | "continue" | "status" | "wait";
 	name?: string;
 	url?: string;
 	description?: string;
+	goal?: string;
+	challengeId?: string;
+	notes?: string;
 	challengeIds?: string[];
 	timeoutSec?: number;
 }
@@ -364,17 +379,21 @@ export function createDispatchTool(z: Zod, host: ToolHost): CustomTool {
 		name: "ctf_dispatch",
 		label: "CTF dispatch",
 		description: [
-			"Delegate challenges to standard worker models, each in its own isolated container and volume.",
-			"action=start {name, url?, description?} queues a worker and returns an opaque challengeId immediately (workers run concurrently up to the configured limit).",
+			"Delegate challenges to standard worker models, each in its own isolated container and volume, ONE SMALL SECTION AT A TIME.",
+			"action=start {name, url?, description?, goal} queues a challenge with its first section goal and returns an opaque challengeId immediately (workers run concurrently up to the configured limit).",
+			"action=continue {challengeId, goal, notes?} starts the next section of a finished challenge: a fresh worker session on the same files, with brief notes of findings so far.",
 			"action=status lists this run's challenges. action=wait {challengeIds?, timeoutSec?} waits (max 600s) for completion and returns results.",
-			"A worker refusal or error is final for this run: do not re-dispatch, rephrase, or attempt the work yourself.",
+			"A worker refusal or error is final for that challenge: do not re-dispatch or re-phrase the same work, or attempt it yourself.",
 		].join(" "),
 		approval: "exec",
 		parameters: z.object({
-			action: z.enum(["start", "status", "wait"]),
+			action: z.enum(["start", "continue", "status", "wait"]),
 			name: z.string().optional(),
 			url: z.string().optional(),
 			description: z.string().optional(),
+			goal: z.string().optional(),
+			challengeId: z.string().optional(),
+			notes: z.string().optional(),
 			challengeIds: z.array(z.string()).optional(),
 			timeoutSec: z.number().optional(),
 		}),
@@ -385,8 +404,16 @@ export function createDispatchTool(z: Zod, host: ToolHost): CustomTool {
 				if (typeof params.name !== "string" || params.name.trim().length === 0 || params.name.length > 200) throw new ValidationError("name is required (max 200 chars)");
 				const url = params.url === undefined ? undefined : assertHttpUrl(params.url).href;
 				if (params.description !== undefined && params.description.length > 20_000) throw new ValidationError("description exceeds 20000 chars");
-				const { challengeId } = await host.dispatch({ name: params.name.trim(), url, description: params.description });
+				if (params.goal !== undefined && params.goal.length > 2_000) throw new ValidationError("goal exceeds 2000 chars");
+				const { challengeId } = await host.dispatch({ name: params.name.trim(), url, description: params.description, goal: params.goal?.trim() || undefined });
 				return text(`Queued ${challengeId} (${params.name.trim()}).`, { challengeId });
+			}
+			if (params.action === "continue") {
+				if (typeof params.challengeId !== "string" || params.challengeId.length === 0) throw new ValidationError("challengeId is required");
+				if (typeof params.goal !== "string" || params.goal.trim().length === 0 || params.goal.length > 2_000) throw new ValidationError("goal is required (max 2000 chars)");
+				if (params.notes !== undefined && params.notes.length > 20_000) throw new ValidationError("notes exceeds 20000 chars");
+				const { challengeId } = await host.continueSection({ challengeId: assertChallengeId(params.challengeId), goal: params.goal.trim(), notes: params.notes });
+				return text(`Queued section for ${challengeId}.`, { challengeId });
 			}
 			if (params.action === "status") return text(JSON.stringify(host.summaries(), null, 1));
 			if (params.action === "wait") {

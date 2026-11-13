@@ -13,6 +13,7 @@ export interface ChallengeView {
 	name: string;
 	status: string;
 	model?: string;
+	sections?: number;
 	detail?: string;
 }
 
@@ -90,7 +91,7 @@ export function statusText(view: RunView): string {
 	if (view.headError) lines.push(`Head error: ${view.headError}`);
 	if (view.challenges.length === 0) lines.push("Challenges: none dispatched yet");
 	for (const c of view.challenges) {
-		lines.push(`  ${STATUS_ICON[c.status]?.icon ?? "·"} ${c.id} ${c.status} — ${c.name}${c.model ? ` (${shortModel(c.model)})` : ""}${c.detail ? ` — ${c.detail}` : ""}`);
+		lines.push(`  ${STATUS_ICON[c.status]?.icon ?? "·"} ${c.id} ${c.status} — ${c.name}${c.model ? ` (${shortModel(c.model)})` : ""}${c.sections && c.sections > 1 ? ` · ${c.sections} sections` : ""}${c.detail ? ` — ${c.detail}` : ""}`);
 	}
 	lines.push("Network: containers have normal outbound access (not isolated from your LAN).");
 	return lines.join("\n");
@@ -188,7 +189,7 @@ export function statusComponent(view: RunView, theme: Theme): Component {
 		for (const c of view.challenges.slice(0, 8)) {
 			const style = STATUS_ICON[c.status] ?? { icon: "·", color: "muted" as ThemeColor };
 			const detail = c.detail ? `  ${c.detail}` : "";
-			lines.push({ indent: 2, prefix: `${style.icon} `, prefixColor: style.color, text: `${c.name}  ${c.status}${c.model ? ` · ${shortModel(c.model)}` : ""}${detail}` });
+			lines.push({ indent: 2, prefix: `${style.icon} `, prefixColor: style.color, text: `${c.name}  ${c.status}${c.model ? ` · ${shortModel(c.model)}` : ""}${c.sections && c.sections > 1 ? ` · ${c.sections} sections` : ""}${detail}` });
 		}
 		if (view.challenges.length > 8) lines.push({ indent: 4, text: `… ${view.challenges.length - 8} more (/ctf status)`, color: "dim" });
 		return lines;

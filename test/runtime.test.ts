@@ -329,3 +329,105 @@ describe("run outcome and main-session events", () => {
 		expect(submitted.lines).toContain("Flag: flag{x}");
 	});
 });
+
+describe("sectioned dispatch", () => {
+	test("continue runs a fresh, narrow worker section on the same container and volume", async () => {
+		const { sdk, sessions } = fakeSdk(async (session, text) => {
+			session.lastText = `result for ${/report and stop:\n(.*)/.exec(text)?.[1] ?? "the whole challenge"}`;
+		});
+		const { run, cli, events } = await makeRun({ sdk });
+		const { challengeId } = await run.dispatch({ name: "rev1", description: "Full website description", goal: "download the files and identify their formats" });
+		await run.waitFor([challengeId], 5000, run.signal);
+		await run.continueSection({ challengeId, goal: "decompile the binary and report main()", notes: "files: a.exe (PE32)" });
+		await run.waitFor([challengeId], 5000, run.signal);
+		expect(sessions).toHaveLength(2);
+		const containers = cli.byCommand("run").filter(c => c.argv.includes("-d") && c.argv.includes("/work"));
+		expect(containers).toHaveLength(1);
+		expect(sessions[0]!.prompts[0]).toContain("Full website description");
+		expect(sessions[0]!.prompts[0]).toContain("download the files and identify their formats");
+		expect(sessions[1]!.prompts[0]).toContain("decompile the binary and report main()");
+		expect(sessions[1]!.prompts[0]).toContain("files: a.exe (PE32)");
+		expect(sessions[1]!.prompts[0]).not.toContain("Full website description");
+		expect(`${sessions[1]!.model.provider}/${sessions[1]!.model.id}`).toBe("std/worker-b");
+		const summary = run.summaries()[0]!;
+		expect(summary.status).toBe("done");
+		expect(summary.sections).toBe(2);
+		expect(summary.result).toContain("decompile the binary and report main()");
+		const dispatched = events.filter(e => e.kind === "dispatched");
+		expect(dispatched).toHaveLength(2);
+		expect(dispatched[1]!.title).toContain("Section 2 of rev1");
+	});
+
+	test("a section cannot continue while running or after a refusal", async () => {
+		const gates = new Gates();
+		const { sdk } = fakeSdk(async session => {
+			await gates.enter();
+			session.lastText = "ok";
+		});
+		const { run } = await makeRun({ sdk });
+		const { challengeId } = await run.dispatch({ name: "a" });
+		await gates.waitForWaiting(1);
+		await expect(run.continueSection({ challengeId, goal: "next" })).rejects.toThrow(/still running; use action=wait/);
+		gates.releaseOne();
+		await run.waitFor([challengeId], 5000, run.signal);
+		await expect(run.continueSection({ challengeId: "c-12345678", goal: "x" })).rejects.toThrow(/Unknown challenge/);
+
+		const { sdk: refusing } = fakeSdk(async session => {
+			session.lastText = "REFUSED: too much at once";
+		});
+		const { run: run2 } = await makeRun({ sdk: refusing });
+		const { challengeId: refused } = await run2.dispatch({ name: "b" });
+		await run2.waitFor([refused], 5000, run2.signal);
+		await expect(run2.continueSection({ challengeId: refused, goal: "smaller step" })).rejects.toThrow(/was refused by its worker/);
+	});
+
+	test("a section cannot continue after a failure", async () => {
+		const { sdk: failing } = fakeSdk(async session => {
+			session.messages.push({ role: "assistant", stopReason: "error", errorMessage: "provider exploded" });
+		});
+		const { run } = await makeRun({ sdk: failing });
+		const { challengeId } = await run.dispatch({ name: "c" });
+		await run.waitFor([challengeId], 5000, run.signal);
+		expect(run.summaries()[0]!.status).toBe("failed");
+		await expect(run.continueSection({ challengeId, goal: "retry" })).rejects.toThrow(/ended with status failed/);
+	});
+
+	test("a submitted flag is preserved when a later section finishes", async () => {
+		const { sdk } = fakeSdk(async session => {
+			session.lastText = "section finished";
+		});
+		const { run } = await makeRun({ sdk });
+		const { challengeId } = await run.dispatch({ name: "s" });
+		run.markSubmitted(challengeId, "flag{a}");
+		await run.waitFor([challengeId], 5000, run.signal);
+		await run.continueSection({ challengeId, goal: "confirm the score" });
+		await run.waitFor([challengeId], 5000, run.signal);
+		const summary = run.summaries()[0]!;
+		expect(summary.status).toBe("submitted");
+		expect(summary.model).toBe("std/worker-b");
+		// The previous section's result is not shown as this section's output.
+		expect(summary.result).toBe("section finished");
+	});
+
+	test("the head drives sections through ctf_dispatch", async () => {
+		const { sdk } = fakeSdk(async (session, text) => {
+			if (session.model === HEAD) {
+				const started = (await session.call("ctf_dispatch", { action: "start", name: "pwn2", description: "site text", goal: "g1" })) as { details: { challengeId: string } };
+				await session.call("ctf_dispatch", { action: "wait", challengeIds: [started.details.challengeId], timeoutSec: 5 });
+				await session.call("ctf_dispatch", { action: "continue", challengeId: started.details.challengeId, goal: "g2", notes: "found n" });
+				await session.call("ctf_dispatch", { action: "wait", challengeIds: [started.details.challengeId], timeoutSec: 5 });
+				session.lastText = "all done";
+			} else {
+				session.lastText = `worker handled ${/report and stop:\n(.*)/.exec(text)?.[1]}`;
+			}
+		});
+		const { run, events } = await makeRun({ sdk });
+		await run.beginHead("https://ctf.test/");
+		expect(run.phase).toBe("finished");
+		expect(run.summaries()[0]!.sections).toBe(2);
+		const workerEvents = events.filter(e => e.kind === "worker");
+		expect(workerEvents).toHaveLength(2);
+		expect(workerEvents[1]!.untrusted).toBe("worker handled g2");
+		expect(workerEvents[1]!.lines).toContain("Section 2");
+	});
+});
