@@ -16,6 +16,7 @@
     "src",
     "!src/**/*.test.ts",
     "docker",
+    "scripts",
     "README.md"
   ],
   "omp": {
@@ -24,6 +25,7 @@
     ]
   },
   "scripts": {
+    "setup": "./scripts/setup.sh",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },

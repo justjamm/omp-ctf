@@ -155,6 +155,20 @@ export function dockerContextDir(name: "browser" | "challenge"): string {
 	return fileURLToPath(new URL(`../docker/${name}`, import.meta.url));
 }
 
+/** One-time installer shipped with the plugin; /ctf itself never installs software. */
+export const SETUP_SCRIPT = fileURLToPath(new URL("../scripts/setup.sh", import.meta.url));
+
+/** Actionable message for a docker CLI that cannot reach its daemon. No resources were created. */
+function daemonHint(stderr: string): string {
+	const detail = stderr || "no server version";
+	const fix = /permission denied/i.test(stderr)
+		? "Your user cannot access the Docker socket yet: log out and back in (docker group) or run 'newgrp docker', then restart omp."
+		: process.platform === "darwin"
+			? "Start it with 'colima start' (or re-run the setup script)."
+			: "Start it with 'sudo systemctl start docker' (or re-run the setup script).";
+	return `The Docker daemon is unavailable: ${detail}. ${fix} Setup script: ${SETUP_SCRIPT}. No resources were created.`;
+}
+
 export function browserContainerName(eventId: string): string {
 	return `omp-ctf-${assertEventId(eventId)}-browser`;
 }
@@ -215,7 +229,7 @@ export class Docker {
 			return {
 				ok: false,
 				reason: "missing-cli",
-				message: "The docker CLI was not found on PATH. Install and configure Docker yourself (Docker Desktop, OrbStack, Colima or Docker Engine), then retry /ctf start. This plugin never installs software.",
+				message: `The docker CLI was not found on PATH. In a terminal (outside OMP), run ${SETUP_SCRIPT} to install Docker and the other dependencies, then retry /ctf.`,
 			};
 		}
 		const result = await this.docker(["info", "--format", "{{.ServerVersion}}"], { signal, timeoutMs: 20_000 });
@@ -223,7 +237,7 @@ export class Docker {
 			return {
 				ok: false,
 				reason: "daemon",
-				message: `The docker CLI is installed but the daemon is unavailable: ${result.stderr.trim() || "no server version"}. Start or configure your Docker daemon, then retry. No resources were created.`,
+				message: daemonHint(result.stderr.trim()),
 			};
 		}
 		return { ok: true, serverVersion: result.stdout.trim() };

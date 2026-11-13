@@ -8,7 +8,7 @@ describe("docker health", () => {
 		cli.hasCli = false;
 		const health = await cli.docker.health();
 		expect(health.ok).toBe(false);
-		expect(health.ok ? "" : health.message).toMatch(/Install and configure Docker yourself/);
+		expect(health.ok ? "" : health.message).toMatch(/scripts\/setup\.sh/);
 		expect(cli.calls).toHaveLength(0);
 	});
 

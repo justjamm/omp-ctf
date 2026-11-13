@@ -6,31 +6,34 @@ Design notes: [CTF-Plugin-Plan wiki page](https://github.com/justjamm/omp-ctf/wi
 
 ## Install
 
-From a checkout:
+From a checkout, run the one-time setup script in a normal terminal (not inside the OMP TUI; it may ask for your `sudo` password):
 
 ```sh
-bun install
-omp plugin link .
+git clone https://github.com/justjamm/omp-ctf && cd omp-ctf
+./scripts/setup.sh        # or: bun run setup (once Bun exists)
 ```
 
-Published package:
+It installs anything missing and is safe to re-run:
+
+| Step | macOS | Linux (apt or dnf) |
+| --- | --- | --- |
+| Base tools | Homebrew (if missing) | `curl`, `ca-certificates`, `gnupg`, `unzip`, `git`, `xdg-utils` |
+| Docker | Colima + `docker` CLI + buildx via Homebrew; starts Colima (4 CPU, 8 GiB, 60 GiB disk) | Docker Engine from Docker's official repository (`docker-ce`, `containerd.io`, buildx); enables the daemon; adds you to the `docker` group |
+| Bun | official installer (`~/.bun`) | official installer (`~/.bun`) |
+| Oh My Pi ≥ 18.20.0 | `brew install can1357/tap/omp` | `bun install -g @oh-my-pi/pi-coding-agent` |
+| Repo | `bun install --frozen-lockfile`, builds `omp-ctf-browser:pw1.65.0-1` and `omp-ctf-challenge:1`, `omp plugin link .` | same |
+
+On Linux, if you were just added to the `docker` group, log out and back in (or `newgrp docker`) before starting `omp`.
+
+Published package (you still need Docker running; the setup script ships in the package under `scripts/`):
 
 ```sh
 omp plugin install omp-ctf
 ```
 
-Requires Oh My Pi `>=18.20.0`.
+## Runtime Docker checks
 
-## Prerequisites: Docker
-
-You must install and run Docker yourself (Docker Desktop, OrbStack, Colima, or Docker Engine on Linux). The plugin needs:
-
-- the `docker` CLI on `PATH`, and
-- a reachable daemon (`docker info` succeeds).
-
-If the CLI is missing, `/ctf` tells you to install it and stops; if the daemon is down, it tells you to start it and creates no resources. **The plugin never runs installers or package managers on your host.**
-
-On first start the plugin builds two images (`omp-ctf-browser:pw1.65.0-1`, `omp-ctf-challenge:1`) from `docker/`.
+`/ctf` itself never installs software. Before it creates anything it checks that the `docker` CLI is on `PATH` and that `docker info` succeeds. If the CLI is missing, it points you at the setup script. If the daemon is down, it says how to start it (`colima start` or `sudo systemctl start docker`, or to log in again if your user can't reach the Docker socket yet) and creates no resources. Missing images are built on first use.
 
 ## Commands
 
