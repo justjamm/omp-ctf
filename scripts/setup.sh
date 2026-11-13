@@ -46,10 +46,37 @@ linux_os_release() {
 	DISTRO_CODENAME="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
 }
 
+DOCKER_APT_LIST=/etc/apt/sources.list.d/docker.list
+
+# docker_repo_has OS CODENAME: true when Docker's apt repository publishes that suite.
+docker_repo_has() {
+	curl -fsI -o /dev/null "https://download.docker.com/linux/$1/dists/$2/Release"
+}
+
+# Pick a suite Docker actually publishes: the distro's own codename when available, otherwise
+# the newest supported base release (e.g. Kali "kali-rolling" -> Debian trixie).
+docker_apt_suite() {
+	local os="$1" candidate fallbacks
+	if [ "$os" = "ubuntu" ]; then fallbacks="noble jammy"; else fallbacks="trixie bookworm"; fi
+	for candidate in $DISTRO_CODENAME $fallbacks; do
+		if docker_repo_has "$os" "$candidate"; then
+			echo "$candidate"
+			return 0
+		fi
+	done
+	return 1
+}
+
 linux_base_packages() {
 	if have apt-get; then
 		log "Installing base packages (apt)"
-		$SUDO apt-get update -y
+		if ! $SUDO apt-get update -y; then
+			# A docker.list from an earlier failed run (e.g. an unpublished codename) breaks every update.
+			[ -f "$DOCKER_APT_LIST" ] || die "apt-get update failed."
+			warn "apt-get update failed; removing $DOCKER_APT_LIST (it is re-created with a supported suite below) and retrying"
+			$SUDO rm -f "$DOCKER_APT_LIST"
+			$SUDO apt-get update -y
+		fi
 		$SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg unzip git xdg-utils
 	elif have dnf; then
 		log "Installing base packages (dnf)"
@@ -78,13 +105,16 @@ linux_install_docker() {
 		esac
 		[ -n "$repo_os" ] || die "No official Docker repository for '$DISTRO_ID'. Install Docker Engine manually: https://docs.docker.com/engine/install/"
 		if have apt-get; then
-			[ -n "$DISTRO_CODENAME" ] || die "Could not determine the distribution codename for Docker's apt repository."
-			log "Adding Docker's official apt repository ($repo_os $DISTRO_CODENAME)"
+			local suite
+			suite="$(docker_apt_suite "$repo_os")" ||
+				die "Docker's $repo_os apt repository has no suite for '${DISTRO_CODENAME:-unknown}' or its fallbacks. Install Docker Engine manually: https://docs.docker.com/engine/install/"
+			[ "$suite" = "$DISTRO_CODENAME" ] || log "Docker publishes no '$DISTRO_CODENAME' suite; using $repo_os $suite"
+			log "Adding Docker's official apt repository ($repo_os $suite)"
 			$SUDO install -m 0755 -d /etc/apt/keyrings
 			$SUDO curl -fsSL "https://download.docker.com/linux/$repo_os/gpg" -o /etc/apt/keyrings/docker.asc
 			$SUDO chmod a+r /etc/apt/keyrings/docker.asc
-			echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$repo_os $DISTRO_CODENAME stable" |
-				$SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
+			echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$repo_os $suite stable" |
+				$SUDO tee "$DOCKER_APT_LIST" >/dev/null
 			$SUDO apt-get update -y
 			$SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
 		else

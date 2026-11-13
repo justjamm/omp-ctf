@@ -22,7 +22,7 @@ It installs anything missing and is safe to re-run:
 | Step | macOS | Linux (apt or dnf) |
 | --- | --- | --- |
 | Base tools | Homebrew (if missing) | `curl`, `ca-certificates`, `gnupg`, `unzip`, `git`, `xdg-utils` |
-| Docker | Colima + `docker` CLI + buildx via Homebrew; starts Colima (4 CPU, 8 GiB, 60 GiB disk) | Docker Engine from Docker's official repository (`docker-ce`, `containerd.io`, buildx); enables the daemon; adds you to the `docker` group |
+| Docker | Colima + `docker` CLI + buildx via Homebrew; starts Colima (4 CPU, 8 GiB, 60 GiB disk) | Docker Engine from Docker's official repository (`docker-ce`, `containerd.io`, buildx); enables the daemon; adds you to the `docker` group. Derivatives without their own Docker suite (e.g. Kali `kali-rolling`) use the newest supported Debian/Ubuntu suite (`trixie`/`bookworm`, `noble`/`jammy`). A broken `docker.list` from an earlier run is removed and re-created. |
 | Bun | official installer (`~/.bun`) | official installer (`~/.bun`) |
 | Oh My Pi ≥ 18.20.0 | `brew install can1357/tap/omp` | `bun install -g @oh-my-pi/pi-coding-agent` |
 | Repo | `bun install --frozen-lockfile`, builds `omp-ctf-browser:pw1.65.0-1` and `omp-ctf-challenge:1`, `omp plugin link .` | same |
