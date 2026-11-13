@@ -2,7 +2,11 @@
 
 Oh My Pi plugin that adds `/ctf`: containerized, operator-supervised automation for **authorized** CTF competitions — challenge discovery, browsing, downloads, analysis, solving and (confirmed) flag submission.
 
-Design notes: [CTF-Plugin-Plan wiki page](https://github.com/justjamm/omp-ctf/wiki/CTF-Plugin-Plan).
+Design notes: [CTF-Plugin-Plan wiki page](https://github.com/justjamm/omp-ctf/wiki/CTF-Plugin-Plan). VM testing guide: [VM-Test-Handoff](https://github.com/justjamm/omp-ctf/wiki/VM-Test-Handoff).
+
+**Status:** unit tests and typecheck pass, and the isolated head/worker sessions were checked against the real OMP 18.20.0 SDK. The Docker path (setup script, image builds, browser container, noVNC, downloads, real runs) has **not** been exercised yet.
+
+**Supported hosts:** macOS and Linux (apt- or dnf-based). Windows is not supported.
 
 ## Install
 
@@ -25,10 +29,10 @@ It installs anything missing and is safe to re-run:
 
 On Linux, if you were just added to the `docker` group, log out and back in (or `newgrp docker`) before starting `omp`.
 
-Published package (you still need Docker running; the setup script ships in the package under `scripts/`):
+The package is not published to npm yet; install from a checkout as above. To re-link manually after pulling changes:
 
 ```sh
-omp plugin install omp-ctf
+omp plugin link .
 ```
 
 ## Runtime Docker checks
