@@ -259,8 +259,42 @@ for registry in mcr.microsoft.com registry-1.docker.io; do
 	fi
 done
 
+# dockerd's pure-Go resolver queries the nameservers in /etc/resolv.conf directly with parallel
+# A/AAAA lookups; some VM NAT DNS servers (e.g. VMware's) mishandle that while glibc works.
+# Switch dockerd to the system (cgo/glibc) resolver via a systemd drop-in.
+docker_use_system_resolver() {
+	local dropin_dir=/etc/systemd/system/docker.service.d
+	local dropin="$dropin_dir/omp-ctf-dns.conf"
+	if [ -f "$dropin" ]; then
+		return 1
+	fi
+	log "dockerd cannot resolve $1 although this host can; switching dockerd to the system resolver ($dropin)"
+	$SUDO mkdir -p "$dropin_dir"
+	printf '[Service]\nEnvironment="GODEBUG=netdns=cgo"\n' | $SUDO tee "$dropin" >/dev/null
+	$SUDO systemctl daemon-reload
+	$SUDO systemctl restart docker
+	for _ in $(seq 1 30); do
+		$SUDO docker info >/dev/null 2>&1 && return 0
+		sleep 1
+	done
+	die "Docker did not come back after restarting with the system resolver."
+}
+
 log "Building omp-ctf images (first run takes several minutes)"
-with_docker bun "$ROOT/scripts/build-images.ts"
+build_status=0
+with_docker bun "$ROOT/scripts/build-images.ts" 2>&1 | tee /tmp/omp-ctf-build.log || build_status=${PIPESTATUS[0]}
+if [ "$build_status" -eq 3 ]; then
+	registry="$(sed -n 's/^unresolved-registry: //p' /tmp/omp-ctf-build.log | tail -n 1)"
+	if [ "$OS" = "Linux" ] && have systemctl && [ -d /run/systemd/system ] && getent hosts "$registry" >/dev/null 2>&1 &&
+		docker_use_system_resolver "$registry"; then
+		log "Retrying the image build"
+		with_docker bun "$ROOT/scripts/build-images.ts"
+	else
+		die "The Docker daemon cannot resolve $registry. Fix this machine's DNS (check 'getent hosts $registry', /etc/resolv.conf, or the VM's network settings), then re-run."
+	fi
+elif [ "$build_status" -ne 0 ]; then
+	die "Image build failed (see above)."
+fi
 
 log "Linking the plugin into Oh My Pi"
 (cd "$ROOT" && omp plugin link .)

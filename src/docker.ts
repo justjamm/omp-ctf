@@ -169,6 +169,12 @@ function daemonHint(stderr: string): string {
 	return `The Docker daemon is unavailable: ${detail}. ${fix} Setup script: ${SETUP_SCRIPT}. No resources were created.`;
 }
 
+/** Registry host Docker failed to resolve during a build/pull, if the log shows a name-resolution failure. */
+export function unresolvedRegistry(log: string): string | undefined {
+	const match = /lookup ([a-z0-9.-]+)(?: on [^:]+:\d+)?: (?:no such host|server misbehaving)|lookup ([a-z0-9.-]+).*(?:Temporary failure in name resolution|i\/o timeout)/i.exec(log);
+	return match?.[1] ?? match?.[2];
+}
+
 /**
  * Short, actionable build error: the final `ERROR` lines instead of the whole BuildKit log, plus a
  * hint when the failure is name resolution or registry reachability (a host/VM network problem).
@@ -177,10 +183,9 @@ export function summarizeBuildFailure(tag: string, code: number, log: string): s
 	const lines = log.split("\n").map(line => line.trim()).filter(Boolean);
 	const errors = lines.filter(line => /^(#\d+ )?ERROR\b/i.test(line) || /^ERROR:/i.test(line));
 	const detail = (errors.length > 0 ? errors.slice(-2) : lines.slice(-5)).join("\n");
-	const host = /lookup ([a-z0-9.-]+)(?: on [^:]+:\d+)?: (?:no such host|server misbehaving)|lookup ([a-z0-9.-]+).*(?:Temporary failure in name resolution|i\/o timeout)/i.exec(log);
-	const registry = host?.[1] ?? host?.[2];
+	const registry = unresolvedRegistry(log);
 	const hint = registry
-		? `\nThe Docker host cannot resolve ${registry}. This is a DNS/network problem on this machine or VM, not in omp-ctf: check that \`getent hosts ${registry}\` works (fix /etc/resolv.conf or the VM's network/DNS settings), then retry.`
+		? `\nThe Docker daemon cannot resolve ${registry}. If \`getent hosts ${registry}\` also fails, fix this machine's DNS (/etc/resolv.conf or the VM's network settings). If it works, dockerd's built-in resolver is incompatible with this DNS server: re-run ${SETUP_SCRIPT}, which switches dockerd to the system resolver.`
 		: /(?:dial tcp|TLS handshake timeout|connection refused|network is unreachable)/i.test(log)
 			? "\nThe Docker host cannot reach the image registry. Check this machine's network/proxy settings, then retry."
 			: "";
